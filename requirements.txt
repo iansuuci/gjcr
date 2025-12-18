@@ -1,0 +1,13 @@
+# Core dependencies for AIME problem solver experiments
+vllm>=0.6.0
+torch>=2.0.0
+transformers>=4.30.0
+
+# Visualization dependencies
+matplotlib>=3.5.0
+numpy>=1.21.0
+
+# Optional: for specific model support
+# accelerate>=0.20.0
+# bitsandbytes>=0.41.0
+
