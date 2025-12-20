@@ -283,7 +283,7 @@ class ModelRunner:
 
 def prompt_only_code(problem: str) -> str:
     """Prompt for ONLY code - no comments, no natural language."""
-    return f"""You are solving an AIME problem. Generate ONLY executable Python code. 
+    return f"""You are solving an math problem. Generate ONLY executable Python code. 
 DO NOT include any comments, explanations, or natural language text.
 DO NOT use markdown code blocks or any formatting.
 Output ONLY the Python code that solves the problem.
@@ -302,7 +302,7 @@ Generate the code now:"""
 
 def prompt_only_comments(problem: str) -> str:
     """Prompt for ONLY comments - reasoning in comments, no executable code."""
-    return f"""You are solving an AIME problem. Generate ONLY comments explaining your reasoning.
+    return f"""You are solving a math problem. Generate ONLY comments explaining your reasoning.
 DO NOT include any executable Python code.
 DO NOT use natural language paragraphs.
 Output ONLY comment lines (lines starting with #) that explain how to solve the problem.
@@ -319,7 +319,7 @@ Generate the comments now:"""
 
 def prompt_both_code_and_comments(problem: str) -> str:
     """Prompt for BOTH code and comments."""
-    return f"""You are solving an AIME problem. Generate Python code WITH comments explaining your reasoning.
+    return f"""You are solving a math problem. Generate Python code WITH comments explaining your reasoning.
 
 Problem: {problem}
 
@@ -334,7 +334,11 @@ Generate the code with comments now:"""
 
 def prompt_nothing(problem: str) -> str:
     """Prompt for NOTHING - just the problem, no instructions."""
-    return f"""{problem}"""
+    return f"""Read the question. Do not think or use Chain of thought. Only output a number as the answer, nothing else. {problem}"""
+
+def prompt_cot(problem: str) -> str:
+    """Prompt for chain of thought reasoning."""
+    return f"""Use chain of thought to solve this problem. {problem}"""
 
 
 # ========================= Adherence Score Calculation =========================
@@ -394,6 +398,12 @@ def calculate_adherence_score(response: str, condition: str) -> Dict[str, float]
         overall = 1.0  # Always adherent (no restrictions)
         details["no_requirements"] = True
         
+    elif condition == "cot":
+        # Chain of thought - should have natural language reasoning
+        # No specific restrictions, but we measure what was produced
+        overall = 1.0  # Always adherent (no restrictions)
+        details["cot_condition"] = True
+        
     else:
         overall = 0.0
     
@@ -446,6 +456,16 @@ def extract_answer(response: str, condition: str) -> Optional[int]:
         if ans is not None:
             return ans
         return None
+        
+    elif condition == "cot":
+        # Chain of thought - try natural language extraction first, then code
+        ans = extract_final_answer_from_text(response)
+        if ans is not None:
+            return ans
+        ans = execute_python_code(response)
+        if ans is not None:
+            return ans
+        return None
     
     return None
 
@@ -463,7 +483,7 @@ def evaluate_problem(runner: ModelRunner, prob: Dict, index: int) -> Dict:
         "true_answer": true_ans,
     }
     
-    conditions = ["only_code", "only_comments", "both", "nothing"]
+    conditions = ["only_code", "only_comments", "both", "nothing", "cot"]
     
     for condition in conditions:
         # Generate prompt
@@ -473,8 +493,10 @@ def evaluate_problem(runner: ModelRunner, prob: Dict, index: int) -> Dict:
             prompt = prompt_only_comments(q)
         elif condition == "both":
             prompt = prompt_both_code_and_comments(q)
-        else:  # nothing
+        elif condition == "nothing":
             prompt = prompt_nothing(q)
+        elif condition == "cot":
+            prompt = prompt_cot(q)
         
         # Print prompt
         print(f"\n  [{condition}] Prompt:")
@@ -523,7 +545,7 @@ def main():
     print("=" * 80)
     print(f"Model: {model_name}")
     print(f"Dataset: AIME 2024 Condensed ({len(AIME_2024_PROBLEMS)} problems)")
-    print(f"Conditions: only_code, only_comments, both, nothing")
+    print(f"Conditions: only_code, only_comments, both, nothing, cot")
     print("=" * 80)
     print()
     
@@ -536,6 +558,7 @@ def main():
         "only_comments": 0,
         "both": 0,
         "nothing": 0,
+        "cot": 0,
     }
     
     adherence_scores = {
@@ -543,6 +566,7 @@ def main():
         "only_comments": [],
         "both": [],
         "nothing": [],
+        "cot": [],
     }
     
     total = len(problems)
@@ -590,6 +614,7 @@ def main():
     print(f"  X' (only Comments):    {correct_counts['only_comments']:3d}/{total} = {X_prime*100:6.2f}%")
     print(f"  X'' (Both):            {correct_counts['both']:3d}/{total} = {X_double_prime*100:6.2f}%")
     print(f"  X''' (Nothing):        {correct_counts['nothing']:3d}/{total} = {X_triple_prime*100:6.2f}%")
+    print(f"  CoT (Chain of Thought): {correct_counts['cot']:3d}/{total} = {success_rates['cot']*100:6.2f}%")
     
     print("\nEffects:")
     print(f"  Δ_Code     = X - X'''  = {delta_code*100:+.2f}%")
