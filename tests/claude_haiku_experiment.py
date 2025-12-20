@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Test Experiment: Can models reason in code?
+Claude Experiment: Can models reason in code?
 
 This experiment measures the effect of code vs comments vs both vs nothing
-on model performance using the AIME condensed dataset and openai/gpt-oss-20b model.
+on model performance using the AIME condensed dataset and Claude API.
 
 Based on the research paper design:
 - X = P(A | only Code)
@@ -25,16 +25,28 @@ import io
 import math
 import json
 import traceback
+import os
 from typing import Dict, Optional, List, Tuple
 from contextlib import redirect_stdout
 from collections import Counter
 
-from vllm import LLM, SamplingParams
+try:
+    from dotenv import load_dotenv
+    load_dotenv()  # Load environment variables from .env file
+except ImportError:
+    print("WARNING: python-dotenv not found. Install with: pip install python-dotenv")
+    print("Will try to use environment variables directly.")
+
+try:
+    from anthropic import Anthropic
+except ImportError:
+    print("ERROR: anthropic package not found. Install with: pip install anthropic")
+    raise
 
 # Load AIME dataset
 try:
-    from datasets.aime_condensed import AIME_2024_PROBLEMS
-    print(f"Loaded {len(AIME_2024_PROBLEMS)} AIME 2024 problems (condensed)")
+    from datasets.aime_problems import AIME_2024_PROBLEMS
+    print(f"Loaded {len(AIME_2024_PROBLEMS)} AIME 2024 problems")
 except Exception as e:
     print(f"WARNING: Could not load AIME problems ({e})")
     raise FileNotFoundError("AIME problems not found")
@@ -224,40 +236,57 @@ def extract_final_answer_from_text(text: str) -> Optional[int]:
 # ========================= Model Wrapper =========================
 
 class ModelRunner:
-    def __init__(self, model_path: str = "openai/gpt-oss-20b"):
-        print(f"Loading model: {model_path}")
-        self.llm = LLM(
-            model=model_path,
-            trust_remote_code=True,
-            tensor_parallel_size=1,
-            gpu_memory_utilization=0.90,
-            max_model_len=16384,
-            dtype="bfloat16",
-            enforce_eager=False,
-            disable_log_stats=True,
-            enable_prefix_caching=True,
-            max_num_seqs=16,
-        )
-        self.params = SamplingParams(
-            temperature=0.0,
-            top_p=1.0,
-            repetition_penalty=1.0,
-            n=1,
-            max_tokens=2048,
-        )
-        print("✓ Model loaded\n")
+    def __init__(self, api_key: Optional[str] = None, model: str = "claude-3-5-haiku-20241022"):
+        """
+        Initialize Claude API client.
+        
+        Args:
+            api_key: Claude API key. If None, will try to get from ANTHROPIC_API_KEY env var.
+            model: Model name to use (default: "claude-3-5-haiku-20241022")
+        """
+        if api_key is None:
+            # Try multiple possible environment variable names
+            api_key = os.getenv("ANTHROPIC_API_KEY") or os.getenv("CLAUDE_API_KEY") or os.getenv("API_KEY_NAME")
+            if api_key is None or api_key == "your_secret_key_here":
+                raise ValueError(
+                    "Claude API key not provided. Set ANTHROPIC_API_KEY (or CLAUDE_API_KEY or API_KEY_NAME) "
+                    "in your .env file or pass api_key parameter."
+                )
+        
+        print(f"Initializing Claude API client (model: {model})")
+        self.client = Anthropic(api_key=api_key)
+        self.model = model
+        print("✓ Claude API client initialized\n")
 
     def generate(self, prompt: str) -> str:
         """Generate response from prompt."""
-        out = self.llm.generate([prompt], self.params)[0]
-        return (out.outputs[0].text or "").strip() if out.outputs else ""
+        try:
+            message = self.client.messages.create(
+                model=self.model,
+                max_tokens=2048,
+                temperature=0.0,
+                messages=[
+                    {"role": "user", "content": prompt}
+                ],
+            )
+            # Claude API returns content as a list of content blocks
+            # Extract text from the first content block
+            if message.content and len(message.content) > 0:
+                if hasattr(message.content[0], 'text'):
+                    return message.content[0].text.strip()
+                elif isinstance(message.content[0], str):
+                    return message.content[0].strip()
+            return ""
+        except Exception as e:
+            print(f"ERROR: Failed to generate response: {e}")
+            return ""
 
 
 # ========================= Prompts for Four Conditions =========================
 
 def prompt_only_code(problem: str) -> str:
     """Prompt for ONLY code - no comments, no natural language."""
-    return f"""You are solving an AIME problem. Generate ONLY executable Python code. 
+    return f"""You are solving an math problem. Generate ONLY executable Python code. 
 DO NOT include any comments, explanations, or natural language text.
 DO NOT use markdown code blocks or any formatting.
 Output ONLY the Python code that solves the problem.
@@ -276,7 +305,7 @@ Generate the code now:"""
 
 def prompt_only_comments(problem: str) -> str:
     """Prompt for ONLY comments - reasoning in comments, no executable code."""
-    return f"""You are solving an AIME problem. Generate ONLY comments explaining your reasoning.
+    return f"""You are solving a math problem. Generate ONLY comments explaining your reasoning.
 DO NOT include any executable Python code.
 DO NOT use natural language paragraphs.
 Output ONLY comment lines (lines starting with #) that explain how to solve the problem.
@@ -293,7 +322,7 @@ Generate the comments now:"""
 
 def prompt_both_code_and_comments(problem: str) -> str:
     """Prompt for BOTH code and comments."""
-    return f"""You are solving an AIME problem. Generate Python code WITH comments explaining your reasoning.
+    return f"""You are solving a problem. Generate Python code WITH comments explaining your reasoning.
 
 Problem: {problem}
 
@@ -308,7 +337,11 @@ Generate the code with comments now:"""
 
 def prompt_nothing(problem: str) -> str:
     """Prompt for NOTHING - just the problem, no instructions."""
-    return f"""{problem}"""
+    return f"""Read the question. Do not think or use Chain of thought. Only output a number as the answer, nothing else. {problem}"""
+
+def prompt_cot(problem: str) -> str:
+    """Prompt for chain of thought reasoning."""
+    return f"""Use chain of thought to solve this problem. {problem}"""
 
 
 # ========================= Adherence Score Calculation =========================
@@ -368,6 +401,12 @@ def calculate_adherence_score(response: str, condition: str) -> Dict[str, float]
         overall = 1.0  # Always adherent (no restrictions)
         details["no_requirements"] = True
         
+    elif condition == "cot":
+        # Chain of thought - should have natural language reasoning
+        # No specific restrictions, but we measure what was produced
+        overall = 1.0  # Always adherent (no restrictions)
+        details["cot_condition"] = True
+        
     else:
         overall = 0.0
     
@@ -420,6 +459,16 @@ def extract_answer(response: str, condition: str) -> Optional[int]:
         if ans is not None:
             return ans
         return None
+        
+    elif condition == "cot":
+        # Chain of thought - try natural language extraction first, then code
+        ans = extract_final_answer_from_text(response)
+        if ans is not None:
+            return ans
+        ans = execute_python_code(response)
+        if ans is not None:
+            return ans
+        return None
     
     return None
 
@@ -427,7 +476,7 @@ def extract_answer(response: str, condition: str) -> Optional[int]:
 # ========================= Evaluation =========================
 
 def evaluate_problem(runner: ModelRunner, prob: Dict, index: int) -> Dict:
-    """Evaluate a single problem across all four conditions."""
+    """Evaluate a single problem across all five conditions."""
     q = prob["question"]
     true_ans = int(prob["answer"])
     
@@ -437,7 +486,7 @@ def evaluate_problem(runner: ModelRunner, prob: Dict, index: int) -> Dict:
         "true_answer": true_ans,
     }
     
-    conditions = ["only_code", "only_comments", "both", "nothing"]
+    conditions = ["only_code", "only_comments", "both", "nothing", "cot"]
     
     for condition in conditions:
         # Generate prompt
@@ -447,8 +496,10 @@ def evaluate_problem(runner: ModelRunner, prob: Dict, index: int) -> Dict:
             prompt = prompt_only_comments(q)
         elif condition == "both":
             prompt = prompt_both_code_and_comments(q)
-        else:  # nothing
+        elif condition == "nothing":
             prompt = prompt_nothing(q)
+        elif condition == "cot":
+            prompt = prompt_cot(q)
         
         # Print prompt
         print(f"\n  [{condition}] Prompt:")
@@ -491,16 +542,17 @@ def evaluate_problem(runner: ModelRunner, prob: Dict, index: int) -> Dict:
 # ========================= Main Experiment =========================
 
 def main():
+    model_name = "claude-3-5-haiku-20241022"
     print("=" * 80)
-    print("Can models reason in code? - Test Experiment")
+    print("Can models reason in code? - Claude Experiment")
     print("=" * 80)
-    print(f"Model: openai/gpt-oss-20b")
+    print(f"Model: {model_name}")
     print(f"Dataset: AIME 2024 Condensed ({len(AIME_2024_PROBLEMS)} problems)")
-    print(f"Conditions: only_code, only_comments, both, nothing")
+    print(f"Conditions: only_code, only_comments, both, nothing, cot")
     print("=" * 80)
     print()
     
-    runner = ModelRunner("openai/gpt-oss-20b")
+    runner = ModelRunner(model=model_name)
     problems = AIME_2024_PROBLEMS
     
     all_results = []
@@ -509,6 +561,7 @@ def main():
         "only_comments": 0,
         "both": 0,
         "nothing": 0,
+        "cot": 0,
     }
     
     adherence_scores = {
@@ -516,6 +569,7 @@ def main():
         "only_comments": [],
         "both": [],
         "nothing": [],
+        "cot": [],
     }
     
     total = len(problems)
@@ -563,6 +617,7 @@ def main():
     print(f"  X' (only Comments):    {correct_counts['only_comments']:3d}/{total} = {X_prime*100:6.2f}%")
     print(f"  X'' (Both):            {correct_counts['both']:3d}/{total} = {X_double_prime*100:6.2f}%")
     print(f"  X''' (Nothing):        {correct_counts['nothing']:3d}/{total} = {X_triple_prime*100:6.2f}%")
+    print(f"  CoT (Chain of Thought): {correct_counts['cot']:3d}/{total} = {success_rates['cot']*100:6.2f}%")
     
     print("\nEffects:")
     print(f"  Δ_Code     = X - X'''  = {delta_code*100:+.2f}%")
@@ -576,7 +631,7 @@ def main():
     print("=" * 80)
     
     # Save detailed results to JSON
-    output_file = "test_experiment_results.json"
+    output_file = "claude_experiment_results.json"
     with open(output_file, "w") as f:
         json.dump({
             "summary": {

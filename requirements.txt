@@ -9,7 +9,6 @@ numpy>=1.21.0
 
 # API clients
 openai>=1.0.0
-anthropic>=0.18.0
 python-dotenv>=1.0.0
 
 # Optional: for specific model support
