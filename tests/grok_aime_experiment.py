@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Claude Experiment: Can models reason in code?
+Grok Experiment: Can models reason in code?
 
 This experiment measures the effect of code vs comments vs both vs nothing
-on model performance using the AIME condensed dataset and Claude API.
+on model performance using the AIME condensed dataset and Grok API.
 
 Based on the research paper design:
 - X = P(A | only Code)
@@ -26,9 +26,13 @@ import math
 import json
 import traceback
 import os
+import sys
 from typing import Dict, Optional, List, Tuple
 from contextlib import redirect_stdout
 from collections import Counter
+
+# Add project root to path for imports
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 try:
     from dotenv import load_dotenv
@@ -38,9 +42,9 @@ except ImportError:
     print("Will try to use environment variables directly.")
 
 try:
-    from anthropic import Anthropic
+    from openai import OpenAI
 except ImportError:
-    print("ERROR: anthropic package not found. Install with: pip install anthropic")
+    print("ERROR: openai package not found. Install with: pip install openai")
     raise
 
 # Load AIME dataset
@@ -145,11 +149,31 @@ def has_natural_language(text: str) -> bool:
     natural_text = " ".join(non_comment_lines)
     return len(natural_text.strip()) > 20  # Threshold for natural language
 
-def execute_python_code(code_text: str) -> Optional[int]:
-    """Execute Python code and extract integer answer."""
+def execute_python_code_detailed(code_text: str) -> Dict:
+    """Execute Python code and extract integer answer with detailed status.
+    
+    Returns:
+        Dict with keys:
+        - answer: Optional[int] - extracted answer or None
+        - code_found: bool - whether code block was found
+        - execution_success: bool - whether code executed without errors
+        - extraction_method: str - how the answer was extracted (or 'failed')
+        - error: Optional[str] - error message if execution failed
+    """
+    result = {
+        "answer": None,
+        "code_found": False,
+        "execution_success": False,
+        "extraction_method": "failed",
+        "error": None,
+    }
+    
     code = extract_code_block(code_text)
     if not code:
-        return None
+        result["error"] = "no_code_block"
+        return result
+    
+    result["code_found"] = True
     
     safe_globals = {
         "__builtins__": {
@@ -171,18 +195,24 @@ def execute_python_code(code_text: str) -> Optional[int]:
         with redirect_stdout(out_buf):
             exec(code, safe_globals, safe_locals)
         
+        result["execution_success"] = True
+        
         # Try to extract from printed output
         printed = out_buf.getvalue().strip()
         m = re.findall(r"__ANS__\s*=\s*(-?\d+)", printed)
         if m:
-            return _normalize_aime_int(int(m[-1]))
+            result["answer"] = _normalize_aime_int(int(m[-1]))
+            result["extraction_method"] = "print_ANS"
+            return result
         
         # Try common variable names
         for key in ("answer", "result", "final_answer", "ans", "solution", "output"):
             if key in safe_locals:
                 v = _coerce_int(safe_locals[key])
                 if v is not None:
-                    return _normalize_aime_int(v)
+                    result["answer"] = _normalize_aime_int(v)
+                    result["extraction_method"] = f"variable_{key}"
+                    return result
         
         # Try executing solve() or main() if present
         for fn_name in ("solve", "main"):
@@ -194,26 +224,42 @@ def execute_python_code(code_text: str) -> Optional[int]:
                 printed2 = out_buf2.getvalue().strip()
                 m2 = re.findall(r"__ANS__\s*=\s*(-?\d+)", printed2)
                 if m2:
-                    return _normalize_aime_int(int(m2[-1]))
+                    result["answer"] = _normalize_aime_int(int(m2[-1]))
+                    result["extraction_method"] = f"function_{fn_name}_print"
+                    return result
                 v = _coerce_int(ret)
                 if v is not None:
-                    return _normalize_aime_int(v)
+                    result["answer"] = _normalize_aime_int(v)
+                    result["extraction_method"] = f"function_{fn_name}_return"
+                    return result
         
         # Parse from printed output
         nums = re.findall(r"-?\d{1,3}", printed)
         if nums:
-            return _normalize_aime_int(int(nums[-1]))
+            result["answer"] = _normalize_aime_int(int(nums[-1]))
+            result["extraction_method"] = "printed_number"
+            return result
         
-        return None
-    except Exception:
-        return None
+        result["error"] = "no_answer_found"
+        return result
+    except Exception as e:
+        result["error"] = str(e)[:100]  # Truncate long error messages
+        return result
+
+
+def execute_python_code(code_text: str) -> Optional[int]:
+    """Execute Python code and extract integer answer (simple wrapper)."""
+    result = execute_python_code_detailed(code_text)
+    return result["answer"]
 
 def extract_final_answer_from_text(text: str) -> Optional[int]:
     """Extract final answer from natural language text."""
     patterns = [
+        r"\\boxed\{(\d{1,3})\}",  # LaTeX boxed answer (highest priority)
         r"\*\*Final Answer[:\s]*(-?\d{1,3})\*\*",
         r"Final Answer[:\s]*(-?\d{1,3})",
         r"The final answer is[:\s]*(-?\d{1,3})",
+        r"The answer is[:\s]*(-?\d{1,3})",
         r"Answer[:\s]*(-?\d{1,3})",
         r"=\s*(-?\d{1,3})\s*$",
     ]
@@ -236,50 +282,74 @@ def extract_final_answer_from_text(text: str) -> Optional[int]:
 # ========================= Model Wrapper =========================
 
 class ModelRunner:
-    def __init__(self, api_key: Optional[str] = None, model: str = "claude-3-5-haiku-20241022"):
+    def __init__(self, api_key: Optional[str] = None, 
+                 reasoning_model: str = "grok-4-1-fast-reasoning",
+                 non_reasoning_model: str = "grok-4-1-fast-non-reasoning"):
         """
-        Initialize Claude API client.
+        Initialize Grok API client.
         
         Args:
-            api_key: Claude API key. If None, will try to get from ANTHROPIC_API_KEY env var.
-            model: Model name to use (default: "claude-3-5-haiku-20241022")
+            api_key: Grok API key. If None, will try to get from GROK_API_KEY env var.
+            reasoning_model: Model name for reasoning mode (default: "grok-4-1-fast-reasoning")
+            non_reasoning_model: Model name for non-reasoning mode (default: "grok-4-1-fast")
         """
         if api_key is None:
             # Try multiple possible environment variable names
-            api_key = os.getenv("ANTHROPIC_API_KEY") or os.getenv("CLAUDE_API_KEY") or os.getenv("API_KEY_NAME")
+            api_key = os.getenv("GROK_API_KEY") or os.getenv("XAI_API_KEY") or os.getenv("API_KEY_NAME")
             if api_key is None or api_key == "your_secret_key_here":
                 raise ValueError(
-                    "Claude API key not provided. Set ANTHROPIC_API_KEY (or CLAUDE_API_KEY or API_KEY_NAME) "
+                    "Grok API key not provided. Set GROK_API_KEY (or XAI_API_KEY or API_KEY_NAME) "
                     "in your .env file or pass api_key parameter."
                 )
         
-        print(f"Initializing Claude API client (model: {model})")
-        self.client = Anthropic(api_key=api_key)
-        self.model = model
-        print("✓ Claude API client initialized\n")
+        print(f"Initializing Grok API client")
+        print(f"  Reasoning model: {reasoning_model}")
+        print(f"  Non-reasoning model: {non_reasoning_model}")
+        # Grok API uses OpenAI-compatible SDK with custom base URL
+        self.client = OpenAI(
+            api_key=api_key,
+            base_url="https://api.x.ai/v1",
+        )
+        self.reasoning_model = reasoning_model
+        self.non_reasoning_model = non_reasoning_model
+        print("✓ Grok API client initialized\n")
 
-    def generate(self, prompt: str) -> str:
-        """Generate response from prompt."""
+    def generate(self, prompt: str, use_reasoning: bool = True) -> Tuple[str, Dict]:
+        """Generate response from prompt.
+        
+        Args:
+            prompt: The prompt to send to the model.
+            use_reasoning: If True, use reasoning model. If False, use non-reasoning model.
+            
+        Returns:
+            Tuple of (response_text, token_usage_dict)
+            token_usage_dict contains: prompt_tokens, completion_tokens, total_tokens
+        """
+        model = self.reasoning_model if use_reasoning else self.non_reasoning_model
+        token_usage = {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+        }
         try:
-            message = self.client.messages.create(
-                model=self.model,
-                max_tokens=2048,
-                temperature=0.0,
+            response = self.client.chat.completions.create(
+                model=model,
                 messages=[
                     {"role": "user", "content": prompt}
                 ],
+                temperature=0.0,
+                max_tokens=16000,
             )
-            # Claude API returns content as a list of content blocks
-            # Extract text from the first content block
-            if message.content and len(message.content) > 0:
-                if hasattr(message.content[0], 'text'):
-                    return message.content[0].text.strip()
-                elif isinstance(message.content[0], str):
-                    return message.content[0].strip()
-            return ""
+            # Extract token usage from response
+            if hasattr(response, 'usage') and response.usage:
+                token_usage["prompt_tokens"] = response.usage.prompt_tokens or 0
+                token_usage["completion_tokens"] = response.usage.completion_tokens or 0
+                token_usage["total_tokens"] = response.usage.total_tokens or 0
+            
+            return (response.choices[0].message.content or "").strip(), token_usage
         except Exception as e:
             print(f"ERROR: Failed to generate response: {e}")
-            return ""
+            return "", token_usage
 
 
 # ========================= Prompts for Four Conditions =========================
@@ -336,12 +406,19 @@ Requirements:
 Generate the code with comments now:"""
 
 def prompt_nothing(problem: str) -> str:
-    """Prompt for NOTHING - just the problem, no instructions."""
-    return f"""Read the question. Do not think or use Chain of thought. Only output a number as the answer, nothing else. {problem}"""
+    """Prompt for NOTHING - just the problem, minimal instructions.
+    
+    Uses non-reasoning model, so we just ask for the answer directly.
+    """
+    return f"""Do not use reasoning and solve the problem.
+
+Problem: {problem}
+
+Answer:"""
 
 def prompt_cot(problem: str) -> str:
     """Prompt for chain of thought reasoning."""
-    return f"""Use chain of thought to solve this problem. {problem}"""
+    return f"""Use chain of thought reasoning to solve this problem and mark the final answer with answer: . Problem: {problem}"""
 
 
 # ========================= Adherence Score Calculation =========================
@@ -418,65 +495,115 @@ def calculate_adherence_score(response: str, condition: str) -> Dict[str, float]
 
 # ========================= Answer Extraction by Condition =========================
 
-def extract_answer(response: str, condition: str) -> Optional[int]:
-    """Extract answer from response based on condition."""
+def extract_answer_detailed(response: str, condition: str) -> Dict:
+    """Extract answer from response with detailed tracking.
+    
+    Returns:
+        Dict with keys:
+        - answer: Optional[int] - the extracted answer
+        - extraction_source: str - where the answer came from
+        - code_details: Dict - details about code execution (if attempted)
+    """
+    result = {
+        "answer": None,
+        "extraction_source": "none",
+        "code_details": None,
+    }
+    
     if condition == "only_code":
         # Try to execute code
-        ans = execute_python_code(response)
-        if ans is not None:
-            return ans
+        code_result = execute_python_code_detailed(response)
+        result["code_details"] = code_result
+        if code_result["answer"] is not None:
+            result["answer"] = code_result["answer"]
+            result["extraction_source"] = f"code_exec:{code_result['extraction_method']}"
+            return result
         # Fallback: try to parse from code text
-        return extract_final_answer_from_text(response)
+        ans = extract_final_answer_from_text(response)
+        if ans is not None:
+            result["answer"] = ans
+            result["extraction_source"] = "text_fallback"
+        return result
         
     elif condition == "only_comments":
         # Extract from comments
         comments = extract_comments(response)
         ans = extract_final_answer_from_text(comments)
         if ans is not None:
-            return ans
+            result["answer"] = ans
+            result["extraction_source"] = "comments"
+            return result
         # Fallback: try natural language extraction
-        return extract_final_answer_from_text(response)
+        ans = extract_final_answer_from_text(response)
+        if ans is not None:
+            result["answer"] = ans
+            result["extraction_source"] = "text_fallback"
+        return result
         
     elif condition == "both":
         # Try code execution first
-        ans = execute_python_code(response)
-        if ans is not None:
-            return ans
+        code_result = execute_python_code_detailed(response)
+        result["code_details"] = code_result
+        if code_result["answer"] is not None:
+            result["answer"] = code_result["answer"]
+            result["extraction_source"] = f"code_exec:{code_result['extraction_method']}"
+            return result
         # Fallback: try comments
         comments = extract_comments(response)
         ans = extract_final_answer_from_text(comments)
         if ans is not None:
-            return ans
+            result["answer"] = ans
+            result["extraction_source"] = "comments_fallback"
+            return result
         # Final fallback: natural language
-        return extract_final_answer_from_text(response)
-        
-    elif condition == "nothing":
-        # Try all methods
-        ans = execute_python_code(response)
-        if ans is not None:
-            return ans
         ans = extract_final_answer_from_text(response)
         if ans is not None:
-            return ans
-        return None
+            result["answer"] = ans
+            result["extraction_source"] = "text_fallback"
+        return result
+        
+    elif condition == "nothing":
+        # Try text extraction first (most likely for non-reasoning model)
+        ans = extract_final_answer_from_text(response)
+        if ans is not None:
+            result["answer"] = ans
+            result["extraction_source"] = "text"
+            return result
+        # Fallback: try code execution
+        code_result = execute_python_code_detailed(response)
+        result["code_details"] = code_result
+        if code_result["answer"] is not None:
+            result["answer"] = code_result["answer"]
+            result["extraction_source"] = f"code_exec:{code_result['extraction_method']}"
+        return result
         
     elif condition == "cot":
         # Chain of thought - try natural language extraction first, then code
         ans = extract_final_answer_from_text(response)
         if ans is not None:
-            return ans
-        ans = execute_python_code(response)
-        if ans is not None:
-            return ans
-        return None
+            result["answer"] = ans
+            result["extraction_source"] = "text"
+            return result
+        code_result = execute_python_code_detailed(response)
+        result["code_details"] = code_result
+        if code_result["answer"] is not None:
+            result["answer"] = code_result["answer"]
+            result["extraction_source"] = f"code_exec:{code_result['extraction_method']}"
+        return result
     
-    return None
+    return result
+
+
+def extract_answer(response: str, condition: str) -> Optional[int]:
+    """Extract answer from response based on condition (simple wrapper)."""
+    result = extract_answer_detailed(response, condition)
+    return result["answer"]
 
 
 # ========================= Evaluation =========================
 
 def evaluate_problem(runner: ModelRunner, prob: Dict, index: int) -> Dict:
-    """Evaluate a single problem across all five conditions."""
+    """Evaluate a single problem across all four conditions."""
     q = prob["question"]
     true_ans = int(prob["answer"])
     
@@ -502,14 +629,16 @@ def evaluate_problem(runner: ModelRunner, prob: Dict, index: int) -> Dict:
             prompt = prompt_cot(q)
         
         # Print prompt
-        print(f"\n  [{condition}] Prompt:")
+        use_reasoning = (condition != "nothing")
+        model_mode = "reasoning" if use_reasoning else "non-reasoning"
+        print(f"\n  [{condition}] Prompt (model: {model_mode}):")
         print("  " + "-" * 76)
         for line in prompt.splitlines():
             print(f"  {line}")
         print("  " + "-" * 76)
         
-        # Generate response
-        response = runner.generate(prompt)
+        # Generate response (use non-reasoning model for "nothing" condition)
+        response, token_usage = runner.generate(prompt, use_reasoning=use_reasoning)
         
         # Print response
         print(f"\n  [{condition}] Model Response:")
@@ -518,8 +647,13 @@ def evaluate_problem(runner: ModelRunner, prob: Dict, index: int) -> Dict:
             print(f"  {line}")
         print("  " + "-" * 76)
         
-        # Extract answer
-        pred = extract_answer(response, condition)
+        # Print token usage
+        print(f"\n  [{condition}] Token Usage: prompt={token_usage['prompt_tokens']}, "
+              f"completion={token_usage['completion_tokens']}, total={token_usage['total_tokens']}")
+        
+        # Extract answer with detailed tracking
+        extraction_result = extract_answer_detailed(response, condition)
+        pred = extraction_result["answer"]
         
         # Calculate adherence
         adherence = calculate_adherence_score(response, condition)
@@ -530,11 +664,28 @@ def evaluate_problem(runner: ModelRunner, prob: Dict, index: int) -> Dict:
         results[f"{condition}_prediction"] = pred
         results[f"{condition}_correct"] = (pred == true_ans) if pred is not None else False
         results[f"{condition}_adherence"] = adherence
+        results[f"{condition}_extraction"] = extraction_result
+        results[f"{condition}_token_usage"] = token_usage
         
+        # Build summary string with extraction details
         pred_str = str(pred) if pred is not None else 'None'
+        extraction_src = extraction_result["extraction_source"]
+        code_details = extraction_result.get("code_details")
+        
+        code_status = ""
+        if code_details:
+            if code_details["code_found"]:
+                if code_details["execution_success"]:
+                    code_status = "code:✓"
+                else:
+                    code_status = f"code:✗({code_details.get('error', 'unknown')[:20]})"
+            else:
+                code_status = "code:not_found"
+        
         print(f"\n  [{condition}] Summary: pred={pred_str:>3s}, "
               f"correct={'✓' if (pred == true_ans) else '✗'}, "
-              f"adherence={adherence['overall_score']:.2f}")
+              f"source={extraction_src}, {code_status}"
+              f", adherence={adherence['overall_score']:.2f}, tokens={token_usage['total_tokens']}")
     
     return results
 
@@ -542,17 +693,19 @@ def evaluate_problem(runner: ModelRunner, prob: Dict, index: int) -> Dict:
 # ========================= Main Experiment =========================
 
 def main():
-    model_name = "claude-3-5-haiku-20241022"
+    reasoning_model = "grok-4-1-fast-reasoning"
+    non_reasoning_model = "grok-4-1-fast-non-reasoning"
     print("=" * 80)
-    print("Can models reason in code? - Claude Experiment")
+    print("Can models reason in code? - Grok Experiment")
     print("=" * 80)
-    print(f"Model: {model_name}")
+    print(f"Reasoning Model: {reasoning_model}")
+    print(f"Non-Reasoning Model: {non_reasoning_model}")
     print(f"Dataset: AIME 2024 Condensed ({len(AIME_2024_PROBLEMS)} problems)")
-    print(f"Conditions: only_code, only_comments, both, nothing, cot")
+    print(f"Conditions: only_code, only_comments, both, nothing (non-reasoning), cot")
     print("=" * 80)
     print()
     
-    runner = ModelRunner(model=model_name)
+    runner = ModelRunner(reasoning_model=reasoning_model, non_reasoning_model=non_reasoning_model)
     problems = AIME_2024_PROBLEMS
     
     all_results = []
@@ -572,6 +725,25 @@ def main():
         "cot": [],
     }
     
+    # Track code execution stats for conditions that use code
+    code_stats = {
+        "only_code": {"code_found": 0, "exec_success": 0, "exec_fail": 0, "answer_from_code": 0},
+        "both": {"code_found": 0, "exec_success": 0, "exec_fail": 0, "answer_from_code": 0},
+    }
+    
+    # Track extraction sources
+    extraction_sources = {condition: Counter() for condition in ["only_code", "only_comments", "both", "nothing", "cot"]}
+    
+    # Track token usage for each condition
+    token_stats = {
+        condition: {
+            "prompt_tokens": [],
+            "completion_tokens": [],
+            "total_tokens": [],
+        }
+        for condition in ["only_code", "only_comments", "both", "nothing", "cot"]
+    }
+    
     total = len(problems)
     
     for i, prob in enumerate(problems, 1):
@@ -586,6 +758,30 @@ def main():
             if res[f"{condition}_correct"]:
                 correct_counts[condition] += 1
             adherence_scores[condition].append(res[f"{condition}_adherence"]["overall_score"])
+            
+            # Track extraction sources
+            extraction = res.get(f"{condition}_extraction", {})
+            source = extraction.get("extraction_source", "unknown")
+            extraction_sources[condition][source] += 1
+            
+            # Track token usage
+            token_usage = res.get(f"{condition}_token_usage", {})
+            token_stats[condition]["prompt_tokens"].append(token_usage.get("prompt_tokens", 0))
+            token_stats[condition]["completion_tokens"].append(token_usage.get("completion_tokens", 0))
+            token_stats[condition]["total_tokens"].append(token_usage.get("total_tokens", 0))
+            
+            # Track code execution stats
+            if condition in code_stats:
+                code_details = extraction.get("code_details")
+                if code_details:
+                    if code_details.get("code_found"):
+                        code_stats[condition]["code_found"] += 1
+                        if code_details.get("execution_success"):
+                            code_stats[condition]["exec_success"] += 1
+                        else:
+                            code_stats[condition]["exec_fail"] += 1
+                    if source.startswith("code_exec:"):
+                        code_stats[condition]["answer_from_code"] += 1
     
     # Calculate success rates
     success_rates = {}
@@ -608,6 +804,33 @@ def main():
         scores = adherence_scores[condition]
         avg_adherence[condition] = sum(scores) / len(scores) if scores else 0.0
     
+    # Calculate token statistics
+    token_summary = {}
+    for condition in token_stats.keys():
+        prompt_tokens = token_stats[condition]["prompt_tokens"]
+        completion_tokens = token_stats[condition]["completion_tokens"]
+        total_tokens = token_stats[condition]["total_tokens"]
+        token_summary[condition] = {
+            "prompt_tokens": {
+                "total": sum(prompt_tokens),
+                "avg": sum(prompt_tokens) / len(prompt_tokens) if prompt_tokens else 0,
+                "min": min(prompt_tokens) if prompt_tokens else 0,
+                "max": max(prompt_tokens) if prompt_tokens else 0,
+            },
+            "completion_tokens": {
+                "total": sum(completion_tokens),
+                "avg": sum(completion_tokens) / len(completion_tokens) if completion_tokens else 0,
+                "min": min(completion_tokens) if completion_tokens else 0,
+                "max": max(completion_tokens) if completion_tokens else 0,
+            },
+            "total_tokens": {
+                "total": sum(total_tokens),
+                "avg": sum(total_tokens) / len(total_tokens) if total_tokens else 0,
+                "min": min(total_tokens) if total_tokens else 0,
+                "max": max(total_tokens) if total_tokens else 0,
+            },
+        }
+    
     # Print results
     print("\n" + "=" * 80)
     print("FINAL RESULTS")
@@ -628,10 +851,66 @@ def main():
     for condition in avg_adherence.keys():
         print(f"  {condition:15s}: {avg_adherence[condition]:.3f}")
     
-    print("=" * 80)
+    print("\n" + "-" * 80)
+    print("TOKEN USAGE ANALYSIS")
+    print("-" * 80)
+    print("\n  Average tokens per problem by condition:")
+    print(f"  {'Condition':<15s} {'Prompt':>10s} {'Completion':>12s} {'Total':>10s}")
+    print("  " + "-" * 49)
+    for condition in ["only_code", "only_comments", "both", "nothing", "cot"]:
+        stats = token_summary[condition]
+        print(f"  {condition:<15s} {stats['prompt_tokens']['avg']:>10.0f} "
+              f"{stats['completion_tokens']['avg']:>12.0f} {stats['total_tokens']['avg']:>10.0f}")
+    
+    print("\n  Max tokens used per problem by condition:")
+    print(f"  {'Condition':<15s} {'Prompt':>10s} {'Completion':>12s} {'Total':>10s}")
+    print("  " + "-" * 49)
+    for condition in ["only_code", "only_comments", "both", "nothing", "cot"]:
+        stats = token_summary[condition]
+        print(f"  {condition:<15s} {stats['prompt_tokens']['max']:>10d} "
+              f"{stats['completion_tokens']['max']:>12d} {stats['total_tokens']['max']:>10d}")
+    
+    print("\n  Total tokens across all problems by condition:")
+    print(f"  {'Condition':<15s} {'Prompt':>10s} {'Completion':>12s} {'Total':>10s}")
+    print("  " + "-" * 49)
+    for condition in ["only_code", "only_comments", "both", "nothing", "cot"]:
+        stats = token_summary[condition]
+        print(f"  {condition:<15s} {stats['prompt_tokens']['total']:>10d} "
+              f"{stats['completion_tokens']['total']:>12d} {stats['total_tokens']['total']:>10d}")
+    
+    # Calculate grand totals
+    grand_total_prompt = sum(token_summary[c]["prompt_tokens"]["total"] for c in token_summary)
+    grand_total_completion = sum(token_summary[c]["completion_tokens"]["total"] for c in token_summary)
+    grand_total = sum(token_summary[c]["total_tokens"]["total"] for c in token_summary)
+    print("  " + "-" * 49)
+    print(f"  {'GRAND TOTAL':<15s} {grand_total_prompt:>10d} {grand_total_completion:>12d} {grand_total:>10d}")
+    
+    print("\n" + "-" * 80)
+    print("CODE EXECUTION ANALYSIS")
+    print("-" * 80)
+    for condition in ["only_code", "both"]:
+        stats = code_stats[condition]
+        print(f"\n  {condition}:")
+        print(f"    Code blocks found:     {stats['code_found']:3d}/{total}")
+        print(f"    Execution success:     {stats['exec_success']:3d}/{stats['code_found'] if stats['code_found'] > 0 else 1} "
+              f"({100*stats['exec_success']/max(stats['code_found'],1):.1f}%)")
+        print(f"    Execution failed:      {stats['exec_fail']:3d}/{stats['code_found'] if stats['code_found'] > 0 else 1} "
+              f"({100*stats['exec_fail']/max(stats['code_found'],1):.1f}%)")
+        print(f"    Answer from code:      {stats['answer_from_code']:3d}/{total} "
+              f"({100*stats['answer_from_code']/total:.1f}%)")
+    
+    print("\n" + "-" * 80)
+    print("EXTRACTION SOURCE BREAKDOWN")
+    print("-" * 80)
+    for condition in ["only_code", "only_comments", "both", "nothing", "cot"]:
+        print(f"\n  {condition}:")
+        for source, count in extraction_sources[condition].most_common():
+            print(f"    {source:30s}: {count:3d} ({100*count/total:.1f}%)")
+    
+    print("\n" + "=" * 80)
     
     # Save detailed results to JSON
-    output_file = "claude_experiment_results.json"
+    output_file = "grok_experiment_results.json"
     with open(output_file, "w") as f:
         json.dump({
             "summary": {
@@ -643,6 +922,9 @@ def main():
                     "delta_cot": delta_cot,
                 },
                 "average_adherence": avg_adherence,
+                "code_execution_stats": code_stats,
+                "extraction_sources": {k: dict(v) for k, v in extraction_sources.items()},
+                "token_usage": token_summary,
             },
             "detailed_results": all_results,
         }, f, indent=2)

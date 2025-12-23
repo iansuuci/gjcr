@@ -313,14 +313,23 @@ class ModelRunner:
         self.non_reasoning_model = non_reasoning_model
         print("✓ DeepSeek API client initialized\n")
 
-    def generate(self, prompt: str, use_reasoning: bool = True) -> str:
+    def generate(self, prompt: str, use_reasoning: bool = True) -> Tuple[str, Dict]:
         """Generate response from prompt.
         
         Args:
             prompt: The prompt to send to the model.
             use_reasoning: If True, use reasoning model. If False, use non-reasoning model.
+            
+        Returns:
+            Tuple of (response_text, token_usage_dict)
+            token_usage_dict contains: prompt_tokens, completion_tokens, total_tokens
         """
         model = self.reasoning_model if use_reasoning else self.non_reasoning_model
+        token_usage = {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+        }
         try:
             response = self.client.chat.completions.create(
                 model=model,
@@ -330,10 +339,16 @@ class ModelRunner:
                 temperature=0.0,
                 max_tokens=16000,
             )
-            return (response.choices[0].message.content or "").strip()
+            # Extract token usage from response
+            if hasattr(response, 'usage') and response.usage:
+                token_usage["prompt_tokens"] = response.usage.prompt_tokens or 0
+                token_usage["completion_tokens"] = response.usage.completion_tokens or 0
+                token_usage["total_tokens"] = response.usage.total_tokens or 0
+            
+            return (response.choices[0].message.content or "").strip(), token_usage
         except Exception as e:
             print(f"ERROR: Failed to generate response: {e}")
-            return ""
+            return "", token_usage
 
 
 # ========================= Prompts for Four Conditions =========================
@@ -622,7 +637,7 @@ def evaluate_problem(runner: ModelRunner, prob: Dict, index: int) -> Dict:
         print("  " + "-" * 76)
         
         # Generate response (use non-reasoning model for "nothing" condition)
-        response = runner.generate(prompt, use_reasoning=use_reasoning)
+        response, token_usage = runner.generate(prompt, use_reasoning=use_reasoning)
         
         # Print response
         print(f"\n  [{condition}] Model Response:")
@@ -630,6 +645,10 @@ def evaluate_problem(runner: ModelRunner, prob: Dict, index: int) -> Dict:
         for line in response.splitlines():
             print(f"  {line}")
         print("  " + "-" * 76)
+        
+        # Print token usage
+        print(f"\n  [{condition}] Token Usage: prompt={token_usage['prompt_tokens']}, "
+              f"completion={token_usage['completion_tokens']}, total={token_usage['total_tokens']}")
         
         # Extract answer with detailed tracking
         extraction_result = extract_answer_detailed(response, condition)
@@ -645,6 +664,7 @@ def evaluate_problem(runner: ModelRunner, prob: Dict, index: int) -> Dict:
         results[f"{condition}_correct"] = (pred == true_ans) if pred is not None else False
         results[f"{condition}_adherence"] = adherence
         results[f"{condition}_extraction"] = extraction_result
+        results[f"{condition}_token_usage"] = token_usage
         
         # Build summary string with extraction details
         pred_str = str(pred) if pred is not None else 'None'
@@ -664,7 +684,7 @@ def evaluate_problem(runner: ModelRunner, prob: Dict, index: int) -> Dict:
         print(f"\n  [{condition}] Summary: pred={pred_str:>3s}, "
               f"correct={'✓' if (pred == true_ans) else '✗'}, "
               f"source={extraction_src}, {code_status}"
-              f", adherence={adherence['overall_score']:.2f}")
+              f", adherence={adherence['overall_score']:.2f}, tokens={token_usage['total_tokens']}")
     
     return results
 
@@ -713,6 +733,16 @@ def main():
     # Track extraction sources
     extraction_sources = {condition: Counter() for condition in ["only_code", "only_comments", "both", "nothing", "cot"]}
     
+    # Track token usage for each condition
+    token_stats = {
+        condition: {
+            "prompt_tokens": [],
+            "completion_tokens": [],
+            "total_tokens": [],
+        }
+        for condition in ["only_code", "only_comments", "both", "nothing", "cot"]
+    }
+    
     total = len(problems)
     
     for i, prob in enumerate(problems, 1):
@@ -732,6 +762,12 @@ def main():
             extraction = res.get(f"{condition}_extraction", {})
             source = extraction.get("extraction_source", "unknown")
             extraction_sources[condition][source] += 1
+            
+            # Track token usage
+            token_usage = res.get(f"{condition}_token_usage", {})
+            token_stats[condition]["prompt_tokens"].append(token_usage.get("prompt_tokens", 0))
+            token_stats[condition]["completion_tokens"].append(token_usage.get("completion_tokens", 0))
+            token_stats[condition]["total_tokens"].append(token_usage.get("total_tokens", 0))
             
             # Track code execution stats
             if condition in code_stats:
@@ -767,6 +803,33 @@ def main():
         scores = adherence_scores[condition]
         avg_adherence[condition] = sum(scores) / len(scores) if scores else 0.0
     
+    # Calculate token statistics
+    token_summary = {}
+    for condition in token_stats.keys():
+        prompt_tokens = token_stats[condition]["prompt_tokens"]
+        completion_tokens = token_stats[condition]["completion_tokens"]
+        total_tokens = token_stats[condition]["total_tokens"]
+        token_summary[condition] = {
+            "prompt_tokens": {
+                "total": sum(prompt_tokens),
+                "avg": sum(prompt_tokens) / len(prompt_tokens) if prompt_tokens else 0,
+                "min": min(prompt_tokens) if prompt_tokens else 0,
+                "max": max(prompt_tokens) if prompt_tokens else 0,
+            },
+            "completion_tokens": {
+                "total": sum(completion_tokens),
+                "avg": sum(completion_tokens) / len(completion_tokens) if completion_tokens else 0,
+                "min": min(completion_tokens) if completion_tokens else 0,
+                "max": max(completion_tokens) if completion_tokens else 0,
+            },
+            "total_tokens": {
+                "total": sum(total_tokens),
+                "avg": sum(total_tokens) / len(total_tokens) if total_tokens else 0,
+                "min": min(total_tokens) if total_tokens else 0,
+                "max": max(total_tokens) if total_tokens else 0,
+            },
+        }
+    
     # Print results
     print("\n" + "=" * 80)
     print("FINAL RESULTS")
@@ -786,6 +849,40 @@ def main():
     print("\nAverage Adherence Scores:")
     for condition in avg_adherence.keys():
         print(f"  {condition:15s}: {avg_adherence[condition]:.3f}")
+    
+    print("\n" + "-" * 80)
+    print("TOKEN USAGE ANALYSIS")
+    print("-" * 80)
+    print("\n  Average tokens per problem by condition:")
+    print(f"  {'Condition':<15s} {'Prompt':>10s} {'Completion':>12s} {'Total':>10s}")
+    print("  " + "-" * 49)
+    for condition in ["only_code", "only_comments", "both", "nothing", "cot"]:
+        stats = token_summary[condition]
+        print(f"  {condition:<15s} {stats['prompt_tokens']['avg']:>10.0f} "
+              f"{stats['completion_tokens']['avg']:>12.0f} {stats['total_tokens']['avg']:>10.0f}")
+    
+    print("\n  Max tokens used per problem by condition:")
+    print(f"  {'Condition':<15s} {'Prompt':>10s} {'Completion':>12s} {'Total':>10s}")
+    print("  " + "-" * 49)
+    for condition in ["only_code", "only_comments", "both", "nothing", "cot"]:
+        stats = token_summary[condition]
+        print(f"  {condition:<15s} {stats['prompt_tokens']['max']:>10d} "
+              f"{stats['completion_tokens']['max']:>12d} {stats['total_tokens']['max']:>10d}")
+    
+    print("\n  Total tokens across all problems by condition:")
+    print(f"  {'Condition':<15s} {'Prompt':>10s} {'Completion':>12s} {'Total':>10s}")
+    print("  " + "-" * 49)
+    for condition in ["only_code", "only_comments", "both", "nothing", "cot"]:
+        stats = token_summary[condition]
+        print(f"  {condition:<15s} {stats['prompt_tokens']['total']:>10d} "
+              f"{stats['completion_tokens']['total']:>12d} {stats['total_tokens']['total']:>10d}")
+    
+    # Calculate grand totals
+    grand_total_prompt = sum(token_summary[c]["prompt_tokens"]["total"] for c in token_summary)
+    grand_total_completion = sum(token_summary[c]["completion_tokens"]["total"] for c in token_summary)
+    grand_total = sum(token_summary[c]["total_tokens"]["total"] for c in token_summary)
+    print("  " + "-" * 49)
+    print(f"  {'GRAND TOTAL':<15s} {grand_total_prompt:>10d} {grand_total_completion:>12d} {grand_total:>10d}")
     
     print("\n" + "-" * 80)
     print("CODE EXECUTION ANALYSIS")
@@ -826,6 +923,7 @@ def main():
                 "average_adherence": avg_adherence,
                 "code_execution_stats": code_stats,
                 "extraction_sources": {k: dict(v) for k, v in extraction_sources.items()},
+                "token_usage": token_summary,
             },
             "detailed_results": all_results,
         }, f, indent=2)

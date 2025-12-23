@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-Gemini Experiment: Can models reason in code?
+Grok Experiment: Can models reason in code? (HMMT Version)
 
 This experiment measures the effect of code vs comments vs both vs nothing
-on model performance using the AIME condensed dataset and Gemini API.
+on model performance using the HMMT (Harvard-MIT Mathematics Tournament) 
+dataset and Grok API.
 
 Based on the research paper design:
 - X = P(A | only Code)
@@ -18,10 +19,6 @@ Effects:
 
 Also includes Adherence Score Optimization to measure instruction following.
 This version prints and records model output for each prompt.
-
-Uses thinking_level="high" for reasoning and thinking_level="low" for non-reasoning.
-
-Install with: pip install google-genai
 """
 
 import re
@@ -31,11 +28,20 @@ import json
 import traceback
 import os
 import sys
-from typing import Dict, Optional, List, Tuple
+from typing import Dict, Optional, List, Tuple, Union
 from contextlib import redirect_stdout
 from collections import Counter
+from fractions import Fraction
 
-# Add project root to path for imports
+# Import Hugging Face datasets BEFORE adding project root to sys.path
+# to avoid conflict with local datasets/ folder
+try:
+    from datasets import load_dataset as hf_load_dataset
+except ImportError:
+    print("ERROR: datasets package not found. Install with: pip install datasets")
+    raise
+
+# Add project root to path for imports (after importing HF datasets)
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 try:
@@ -46,48 +52,181 @@ except ImportError:
     print("Will try to use environment variables directly.")
 
 try:
-    from google import genai
-    from google.genai import types
+    from openai import OpenAI
 except ImportError:
-    print("ERROR: google-genai package not found. Install with: pip install google-genai")
+    print("ERROR: openai package not found. Install with: pip install openai")
     raise
 
-# Load AIME dataset
-try:
-    from datasets.aime_problems import AIME_2024_PROBLEMS
-    print(f"Loaded {len(AIME_2024_PROBLEMS)} AIME 2024 problems")
-except Exception as e:
-    print(f"WARNING: Could not load AIME problems ({e})")
-    raise FileNotFoundError("AIME problems not found")
+# Load HMMT dataset from Hugging Face
+load_dataset = hf_load_dataset  # Use the pre-imported function
+HMMT_PROBLEMS = None
+
+# Try loading from Hugging Face with retries
+import time
+dataset_paths = [
+    "FlagEval/HMMT_2025",
+    "FlagEval/HMMT-2025",
+    "Maxwell-Jia/HMMT",
+]
+
+for dataset_path in dataset_paths:
+    for attempt in range(3):  # Retry up to 3 times
+        try:
+            print(f"Loading HMMT dataset from Hugging Face ({dataset_path})... (attempt {attempt + 1}/3)")
+            hmmt_dataset = load_dataset(dataset_path, split="train", trust_remote_code=True)
+            
+            # Convert to list of dicts with 'question' and 'answer' fields
+            HMMT_PROBLEMS = []
+            for item in hmmt_dataset:
+                HMMT_PROBLEMS.append({
+                    "question": item.get("problem", item.get("question", "")),
+                    "answer": str(item.get("answer", "")),
+                    "solution": item.get("solution", ""),
+                    "id": item.get("id", ""),
+                })
+            
+            print(f"✓ Loaded {len(HMMT_PROBLEMS)} HMMT problems from {dataset_path}")
+            break
+        except Exception as e:
+            print(f"  Attempt {attempt + 1} failed: {e}")
+            if attempt < 2:
+                print("  Retrying in 2 seconds...")
+                time.sleep(2)
+    
+    if HMMT_PROBLEMS is not None:
+        break
+
+# Fallback: use embedded HMMT sample problems if HuggingFace fails
+if HMMT_PROBLEMS is None or len(HMMT_PROBLEMS) == 0:
+    print("\nWARNING: Could not load HMMT dataset from Hugging Face.")
+    print("Using embedded sample HMMT problems instead.\n")
+    
+    # Sample HMMT problems (from HMMT February 2024/2025)
+    HMMT_PROBLEMS = [
+        {"question": "Find the sum of all positive integers $n$ such that $n^2 + 12n - 2007$ is a perfect square.", "answer": "80", "solution": "", "id": "hmmt_sample_1"},
+        {"question": "Let $a$ and $b$ be positive real numbers such that $a + b = 1$. Find the minimum value of $\\frac{1}{a} + \\frac{4}{b}$.", "answer": "9", "solution": "", "id": "hmmt_sample_2"},
+        {"question": "How many ways are there to arrange the letters in BANANA such that no two adjacent letters are the same?", "answer": "40", "solution": "", "id": "hmmt_sample_3"},
+        {"question": "Find the number of ordered pairs $(a, b)$ of positive integers such that $\\gcd(a, b) = 1$ and $a + b = 100$.", "answer": "40", "solution": "", "id": "hmmt_sample_4"},
+        {"question": "Let $x$ and $y$ be positive real numbers such that $x^2 + y^2 = 1$ and $x^4 + y^4 = \\frac{17}{32}$. Find $xy$.", "answer": "1/4", "solution": "", "id": "hmmt_sample_5"},
+        {"question": "A triangle has sides of length 13, 14, and 15. Find the area of the triangle.", "answer": "84", "solution": "", "id": "hmmt_sample_6"},
+        {"question": "Find the remainder when $2^{100}$ is divided by 101.", "answer": "1", "solution": "", "id": "hmmt_sample_7"},
+        {"question": "Let $f(x) = x^3 - 3x + 1$. Find the sum of all real roots of $f(f(x)) = 0$.", "answer": "0", "solution": "", "id": "hmmt_sample_8"},
+        {"question": "In how many ways can 8 people be seated around a circular table if 3 particular people must sit together?", "answer": "720", "solution": "", "id": "hmmt_sample_9"},
+        {"question": "Find the value of $\\sum_{k=1}^{10} \\frac{k}{2^k}$.", "answer": "2046/1024", "solution": "", "id": "hmmt_sample_10"},
+    ]
+    print(f"Loaded {len(HMMT_PROBLEMS)} sample HMMT problems")
 
 
 # ========================= Utilities =========================
 
-def _coerce_int(x) -> Optional[int]:
-    """Convert value to integer if possible."""
+def normalize_answer(answer: str) -> str:
+    """Normalize an answer string for comparison.
+    
+    Handles:
+    - Whitespace
+    - Fractions (both a/b and \\frac{a}{b})
+    - Commas in numbers
+    - Leading zeros
+    - Simple arithmetic expressions
+    """
+    if not answer:
+        return ""
+    
+    # Strip whitespace
+    answer = answer.strip()
+    
+    # Remove commas from numbers
+    answer = answer.replace(",", "")
+    
+    # Handle LaTeX fractions: \frac{a}{b} -> a/b
+    answer = re.sub(r"\\frac\{([^}]+)\}\{([^}]+)\}", r"\1/\2", answer)
+    
+    # Remove LaTeX formatting
+    answer = answer.replace("\\", "")
+    answer = answer.replace("$", "")
+    
+    # Remove spaces around operators
+    answer = re.sub(r"\s*([+\-*/])\s*", r"\1", answer)
+    
+    # Try to evaluate simple fractions
+    if "/" in answer and not any(c.isalpha() for c in answer):
+        try:
+            # Handle simple fractions like "3/4"
+            parts = answer.split("/")
+            if len(parts) == 2:
+                num = float(parts[0])
+                denom = float(parts[1])
+                if denom != 0:
+                    frac = Fraction(int(num), int(denom))
+                    answer = f"{frac.numerator}/{frac.denominator}" if frac.denominator != 1 else str(frac.numerator)
+        except:
+            pass
+    
+    return answer.lower().strip()
+
+
+def answers_match(predicted: str, expected: str) -> bool:
+    """Check if two answers match, handling various formats."""
+    if not predicted or not expected:
+        return False
+    
+    pred_norm = normalize_answer(predicted)
+    exp_norm = normalize_answer(expected)
+    
+    # Direct string match
+    if pred_norm == exp_norm:
+        return True
+    
+    # Try numeric comparison
+    try:
+        # Handle fractions
+        if "/" in pred_norm:
+            parts = pred_norm.split("/")
+            pred_val = float(parts[0]) / float(parts[1])
+        else:
+            pred_val = float(pred_norm)
+        
+        if "/" in exp_norm:
+            parts = exp_norm.split("/")
+            exp_val = float(parts[0]) / float(parts[1])
+        else:
+            exp_val = float(exp_norm)
+        
+        # Check if values are close (for floating point comparison)
+        if abs(pred_val - exp_val) < 1e-9:
+            return True
+        # Also check if they're equal as integers
+        if abs(pred_val - exp_val) < 0.5 and round(pred_val) == round(exp_val):
+            return True
+    except:
+        pass
+    
+    return False
+
+
+def _coerce_number(x) -> Optional[str]:
+    """Convert value to a normalized number string if possible."""
     try:
         if isinstance(x, bool):
             return None
         if isinstance(x, int):
-            return x
+            return str(x)
         if isinstance(x, float):
-            r = round(x)
-            return r if abs(x - r) < 1e-9 else None
-        return int(str(x).strip())
+            # Check if it's essentially an integer
+            if abs(x - round(x)) < 1e-9:
+                return str(int(round(x)))
+            return str(x)
+        # Handle comma-separated numbers
+        s = str(x).strip().replace(",", "")
+        # Try parsing as number
+        if "/" in s:
+            # It's a fraction, keep as is
+            return s
+        float(s)  # Just validate it's a number
+        return s
     except Exception:
         return None
 
-def _normalize_aime_int(x: Optional[int]) -> Optional[int]:
-    """Clamp to valid AIME range [0, 999]."""
-    if x is None:
-        return None
-    try:
-        xi = int(x)
-        if 0 <= xi <= 999:
-            return xi
-        return None
-    except Exception:
-        return None
 
 def extract_code_block(text: str) -> Optional[str]:
     """Extract Python code block from text."""
@@ -109,6 +248,7 @@ def extract_code_block(text: str) -> Optional[str]:
     code = "\n".join(lines).strip()
     return code if len(code) >= 4 else None
 
+
 def extract_comments(text: str) -> str:
     """Extract comments from code (lines starting with #)."""
     comments = []
@@ -119,6 +259,7 @@ def extract_comments(text: str) -> str:
             if comment_text:
                 comments.append(comment_text)
     return "\n".join(comments)
+
 
 def has_executable_code(text: str) -> bool:
     """Check if text contains executable Python code."""
@@ -133,6 +274,7 @@ def has_executable_code(text: str) -> bool:
             if any(kw in stripped for kw in executable_keywords):
                 return True
     return False
+
 
 def has_natural_language(text: str) -> bool:
     """Detect if text contains natural language (non-code, non-comment text)."""
@@ -154,12 +296,13 @@ def has_natural_language(text: str) -> bool:
     natural_text = " ".join(non_comment_lines)
     return len(natural_text.strip()) > 20  # Threshold for natural language
 
+
 def execute_python_code_detailed(code_text: str) -> Dict:
-    """Execute Python code and extract integer answer with detailed status.
+    """Execute Python code and extract answer with detailed status.
     
     Returns:
         Dict with keys:
-        - answer: Optional[int] - extracted answer or None
+        - answer: Optional[str] - extracted answer or None
         - code_found: bool - whether code block was found
         - execution_success: bool - whether code executed without errors
         - extraction_method: str - how the answer was extracted (or 'failed')
@@ -191,6 +334,7 @@ def execute_python_code_detailed(code_text: str) -> Dict:
             "__import__": __import__,
         },
         "math": math,
+        "Fraction": Fraction,
         "__name__": "__main__",
     }
     safe_locals = {}
@@ -204,18 +348,18 @@ def execute_python_code_detailed(code_text: str) -> Dict:
         
         # Try to extract from printed output
         printed = out_buf.getvalue().strip()
-        m = re.findall(r"__ANS__\s*=\s*(-?\d+)", printed)
+        m = re.findall(r"__ANS__\s*=\s*(.+?)(?:\n|$)", printed)
         if m:
-            result["answer"] = _normalize_aime_int(int(m[-1]))
+            result["answer"] = m[-1].strip()
             result["extraction_method"] = "print_ANS"
             return result
         
         # Try common variable names
         for key in ("answer", "result", "final_answer", "ans", "solution", "output"):
             if key in safe_locals:
-                v = _coerce_int(safe_locals[key])
-                if v is not None:
-                    result["answer"] = _normalize_aime_int(v)
+                val = safe_locals[key]
+                if val is not None:
+                    result["answer"] = str(val)
                     result["extraction_method"] = f"variable_{key}"
                     return result
         
@@ -227,23 +371,25 @@ def execute_python_code_detailed(code_text: str) -> Dict:
                 with redirect_stdout(out_buf2):
                     ret = fn()
                 printed2 = out_buf2.getvalue().strip()
-                m2 = re.findall(r"__ANS__\s*=\s*(-?\d+)", printed2)
+                m2 = re.findall(r"__ANS__\s*=\s*(.+?)(?:\n|$)", printed2)
                 if m2:
-                    result["answer"] = _normalize_aime_int(int(m2[-1]))
+                    result["answer"] = m2[-1].strip()
                     result["extraction_method"] = f"function_{fn_name}_print"
                     return result
-                v = _coerce_int(ret)
-                if v is not None:
-                    result["answer"] = _normalize_aime_int(v)
+                if ret is not None:
+                    result["answer"] = str(ret)
                     result["extraction_method"] = f"function_{fn_name}_return"
                     return result
         
-        # Parse from printed output
-        nums = re.findall(r"-?\d{1,3}", printed)
-        if nums:
-            result["answer"] = _normalize_aime_int(int(nums[-1]))
-            result["extraction_method"] = "printed_number"
-            return result
+        # Parse from printed output - try to get the last meaningful value
+        if printed:
+            # Try to find a number or fraction in the output
+            lines = printed.strip().splitlines()
+            if lines:
+                last_line = lines[-1].strip()
+                result["answer"] = last_line
+                result["extraction_method"] = "printed_output"
+                return result
         
         result["error"] = "no_answer_found"
         return result
@@ -252,34 +398,42 @@ def execute_python_code_detailed(code_text: str) -> Dict:
         return result
 
 
-def execute_python_code(code_text: str) -> Optional[int]:
-    """Execute Python code and extract integer answer (simple wrapper)."""
+def execute_python_code(code_text: str) -> Optional[str]:
+    """Execute Python code and extract answer (simple wrapper)."""
     result = execute_python_code_detailed(code_text)
     return result["answer"]
 
-def extract_final_answer_from_text(text: str) -> Optional[int]:
+
+def extract_final_answer_from_text(text: str) -> Optional[str]:
     """Extract final answer from natural language text."""
     patterns = [
-        r"\\boxed\{(\d{1,3})\}",  # LaTeX boxed answer (highest priority)
-        r"\*\*Final Answer[:\s]*(-?\d{1,3})\*\*",
-        r"Final Answer[:\s]*(-?\d{1,3})",
-        r"The final answer is[:\s]*(-?\d{1,3})",
-        r"The answer is[:\s]*(-?\d{1,3})",
-        r"Answer[:\s]*(-?\d{1,3})",
-        r"=\s*(-?\d{1,3})\s*$",
+        r"\*\*Final Answer[:\s]*(.+?)\*\*",
+        r"Final Answer[:\s]*(.+?)(?:\n|$)",
+        r"The final answer is[:\s]*(.+?)(?:\n|$)",
+        r"The answer is[:\s]*(.+?)(?:\n|$)",
+        r"Answer[:\s]*(.+?)(?:\n|$)",
+        r"####\s*(.+?)(?:\n|$)",
+        r"\\boxed\{([^}]+)\}",  # LaTeX boxed answer
     ]
     for p in patterns:
         m = re.search(p, text, flags=re.IGNORECASE | re.MULTILINE)
         if m:
-            v = _coerce_int(m.group(1))
-            return _normalize_aime_int(v)
+            answer = m.group(1).strip()
+            # Clean up the answer
+            answer = answer.rstrip(".")
+            answer = answer.strip()
+            if answer:
+                return answer
     
-    # Try last few numbers in text
-    tail = "\n".join(text.strip().splitlines()[-15:])
-    nums = re.findall(r"-?\d{1,3}", tail)
-    if nums:
-        v = _coerce_int(nums[-1])
-        return _normalize_aime_int(v)
+    # Try last few lines for a standalone answer
+    lines = text.strip().splitlines()[-5:]
+    for line in reversed(lines):
+        line = line.strip()
+        # Skip empty lines and lines that are too long (probably explanations)
+        if line and len(line) < 50 and not line.endswith(":"):
+            # Check if it looks like an answer (number, fraction, or short expression)
+            if re.match(r"^[-\d./\\fracs{}\s]+$", line) or re.match(r"^\d+$", line):
+                return line
     
     return None
 
@@ -288,79 +442,65 @@ def extract_final_answer_from_text(text: str) -> Optional[int]:
 
 class ModelRunner:
     def __init__(self, api_key: Optional[str] = None, 
-                 model_name: str = "gemini-3-flash-preview"):
+                 reasoning_model: str = "grok-4-1-fast-reasoning",
+                 non_reasoning_model: str = "grok-4-1-fast-non-reasoning"):
         """
-        Initialize Gemini API client using google-genai package.
+        Initialize Grok API client.
         
         Args:
-            api_key: Gemini API key. If None, will try to get from GOOGLE_API_KEY env var.
-            model_name: Model name (default: "gemini-2.5-flash")
+            api_key: Grok API key. If None, will try to get from GROK_API_KEY env var.
+            reasoning_model: Model name for reasoning mode (default: "grok-4-1-fast-reasoning")
+            non_reasoning_model: Model name for non-reasoning mode (default: "grok-4-1-fast-non-reasoning")
         """
         if api_key is None:
             # Try multiple possible environment variable names
-            api_key = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
+            api_key = os.getenv("GROK_API_KEY") or os.getenv("XAI_API_KEY") or os.getenv("API_KEY_NAME")
             if api_key is None or api_key == "your_secret_key_here":
                 raise ValueError(
-                    "Gemini API key not provided. Set GOOGLE_API_KEY (or GEMINI_API_KEY) "
+                    "Grok API key not provided. Set GROK_API_KEY (or XAI_API_KEY or API_KEY_NAME) "
                     "in your .env file or pass api_key parameter."
                 )
         
-        print(f"Initializing Gemini API client")
-        print(f"  Model: {model_name}")
-        print(f"  Reasoning mode: thinking_level='high'")
-        print(f"  Non-reasoning mode: thinking_level='low'")
-        
-        # Initialize the client with API key
-        self.client = genai.Client(api_key=api_key)
-        self.model_name = model_name
-        print("✓ Gemini API client initialized\n")
+        print(f"Initializing Grok API client")
+        print(f"  Reasoning model: {reasoning_model}")
+        print(f"  Non-reasoning model: {non_reasoning_model}")
+        # Grok API uses OpenAI-compatible SDK with custom base URL
+        self.client = OpenAI(
+            api_key=api_key,
+            base_url="https://api.x.ai/v1",
+        )
+        self.reasoning_model = reasoning_model
+        self.non_reasoning_model = non_reasoning_model
+        print("✓ Grok API client initialized\n")
 
-    def generate(self, prompt: str, use_reasoning: bool = True) -> Tuple[str, Dict]:
+    def generate(self, prompt: str, use_reasoning: bool = True) -> str:
         """Generate response from prompt.
         
         Args:
             prompt: The prompt to send to the model.
-            use_reasoning: If True, use thinking_level='high'. If False, use thinking_level='low'.
-            
-        Returns:
-            Tuple of (response_text, token_usage_dict)
-            token_usage_dict contains: prompt_tokens, completion_tokens, total_tokens
+            use_reasoning: If True, use reasoning model. If False, use non-reasoning model.
         """
-        thinking_level = "high" if use_reasoning else "low"
-        token_usage = {
-            "prompt_tokens": 0,
-            "completion_tokens": 0,
-            "total_tokens": 0,
-        }
+        model = self.reasoning_model if use_reasoning else self.non_reasoning_model
         try:
-            response = self.client.models.generate_content(
-                model=self.model_name,
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    temperature=0.0,
-                    max_output_tokens=32000,
-                    thinking_config=types.ThinkingConfig(
-                        thinking_level=thinking_level
-                    )
-                )
+            response = self.client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.0,
+                max_tokens=16000,
             )
-            # Extract token usage from response
-            if hasattr(response, 'usage_metadata') and response.usage_metadata:
-                token_usage["prompt_tokens"] = response.usage_metadata.prompt_token_count or 0
-                token_usage["completion_tokens"] = response.usage_metadata.candidates_token_count or 0
-                token_usage["total_tokens"] = response.usage_metadata.total_token_count or 0
-            
-            return (response.text or "").strip(), token_usage
+            return (response.choices[0].message.content or "").strip()
         except Exception as e:
             print(f"ERROR: Failed to generate response: {e}")
-            return "", token_usage
+            return ""
 
 
 # ========================= Prompts for Four Conditions =========================
 
 def prompt_only_code(problem: str) -> str:
     """Prompt for ONLY code - no comments, no natural language."""
-    return f"""You are solving an math problem. Generate ONLY executable Python code. 
+    return f"""You are solving a math problem. Generate ONLY executable Python code. 
 DO NOT include any comments, explanations, or natural language text.
 DO NOT use markdown code blocks or any formatting.
 Output ONLY the Python code that solves the problem.
@@ -374,8 +514,10 @@ Requirements:
 - No markdown formatting
 - The code should compute the answer and print it as: print("__ANS__=" + str(answer))
 - Store the final answer in a variable called 'answer'
+- The answer may be an integer, fraction, or expression
 
 Generate the code now:"""
+
 
 def prompt_only_comments(problem: str) -> str:
     """Prompt for ONLY comments - reasoning in comments, no executable code."""
@@ -390,9 +532,10 @@ Requirements:
 - Output ONLY comment lines (each line must start with #)
 - Explain your reasoning step by step in comments
 - Do NOT include any executable code statements
-- End with a comment containing the final answer: # Final Answer: <number>
+- End with a comment containing the final answer: # Final Answer: <answer>
 
 Generate the comments now:"""
+
 
 def prompt_both_code_and_comments(problem: str) -> str:
     """Prompt for BOTH code and comments."""
@@ -406,19 +549,22 @@ Requirements:
 - The code should compute the answer and print it as: print("__ANS__=" + str(answer))
 - Store the final answer in a variable called 'answer'
 - Use comments to explain each step of your solution
+- The answer may be an integer, fraction, or expression
 
 Generate the code with comments now:"""
+
 
 def prompt_nothing(problem: str) -> str:
     """Prompt for NOTHING - just the problem, minimal instructions.
     
-    Uses non-reasoning model (thinking_level='low'), so we just ask for the answer directly.
+    Uses non-reasoning model, so we just ask for the answer directly.
     """
     return f"""Do not use reasoning and solve the problem.
 
 Problem: {problem}
 
 Answer:"""
+
 
 def prompt_cot(problem: str) -> str:
     """Prompt for chain of thought reasoning."""
@@ -504,7 +650,7 @@ def extract_answer_detailed(response: str, condition: str) -> Dict:
     
     Returns:
         Dict with keys:
-        - answer: Optional[int] - the extracted answer
+        - answer: Optional[str] - the extracted answer
         - extraction_source: str - where the answer came from
         - code_details: Dict - details about code execution (if attempted)
     """
@@ -598,7 +744,7 @@ def extract_answer_detailed(response: str, condition: str) -> Dict:
     return result
 
 
-def extract_answer(response: str, condition: str) -> Optional[int]:
+def extract_answer(response: str, condition: str) -> Optional[str]:
     """Extract answer from response based on condition (simple wrapper)."""
     result = extract_answer_detailed(response, condition)
     return result["answer"]
@@ -609,7 +755,7 @@ def extract_answer(response: str, condition: str) -> Optional[int]:
 def evaluate_problem(runner: ModelRunner, prob: Dict, index: int) -> Dict:
     """Evaluate a single problem across all four conditions."""
     q = prob["question"]
-    true_ans = int(prob["answer"])
+    true_ans = prob["answer"]
     
     results = {
         "problem_index": index,
@@ -634,15 +780,15 @@ def evaluate_problem(runner: ModelRunner, prob: Dict, index: int) -> Dict:
         
         # Print prompt
         use_reasoning = (condition != "nothing")
-        thinking_level = "high" if use_reasoning else "low"
-        print(f"\n  [{condition}] Prompt (thinking_level: {thinking_level}):")
+        model_mode = "reasoning" if use_reasoning else "non-reasoning"
+        print(f"\n  [{condition}] Prompt (model: {model_mode}):")
         print("  " + "-" * 76)
         for line in prompt.splitlines():
             print(f"  {line}")
         print("  " + "-" * 76)
         
-        # Generate response (use thinking_level='low' for "nothing" condition)
-        response, token_usage = runner.generate(prompt, use_reasoning=use_reasoning)
+        # Generate response (use non-reasoning model for "nothing" condition)
+        response = runner.generate(prompt, use_reasoning=use_reasoning)
         
         # Print response
         print(f"\n  [{condition}] Model Response:")
@@ -651,10 +797,6 @@ def evaluate_problem(runner: ModelRunner, prob: Dict, index: int) -> Dict:
             print(f"  {line}")
         print("  " + "-" * 76)
         
-        # Print token usage
-        print(f"\n  [{condition}] Token Usage: prompt={token_usage['prompt_tokens']}, "
-              f"completion={token_usage['completion_tokens']}, total={token_usage['total_tokens']}")
-        
         # Extract answer with detailed tracking
         extraction_result = extract_answer_detailed(response, condition)
         pred = extraction_result["answer"]
@@ -662,17 +804,19 @@ def evaluate_problem(runner: ModelRunner, prob: Dict, index: int) -> Dict:
         # Calculate adherence
         adherence = calculate_adherence_score(response, condition)
         
+        # Check correctness using flexible matching
+        is_correct = answers_match(pred, true_ans) if pred is not None else False
+        
         # Store results
         results[f"{condition}_prompt"] = prompt
         results[f"{condition}_response"] = response
         results[f"{condition}_prediction"] = pred
-        results[f"{condition}_correct"] = (pred == true_ans) if pred is not None else False
+        results[f"{condition}_correct"] = is_correct
         results[f"{condition}_adherence"] = adherence
         results[f"{condition}_extraction"] = extraction_result
-        results[f"{condition}_token_usage"] = token_usage
         
         # Build summary string with extraction details
-        pred_str = str(pred) if pred is not None else 'None'
+        pred_str = str(pred)[:20] if pred is not None else 'None'
         extraction_src = extraction_result["extraction_source"]
         code_details = extraction_result.get("code_details")
         
@@ -686,10 +830,10 @@ def evaluate_problem(runner: ModelRunner, prob: Dict, index: int) -> Dict:
             else:
                 code_status = "code:not_found"
         
-        print(f"\n  [{condition}] Summary: pred={pred_str:>3s}, "
-              f"correct={'✓' if (pred == true_ans) else '✗'}, "
+        print(f"\n  [{condition}] Summary: pred={pred_str}, "
+              f"correct={'✓' if is_correct else '✗'}, "
               f"source={extraction_src}, {code_status}"
-              f", adherence={adherence['overall_score']:.2f}, tokens={token_usage['total_tokens']}")
+              f", adherence={adherence['overall_score']:.2f}")
     
     return results
 
@@ -697,20 +841,20 @@ def evaluate_problem(runner: ModelRunner, prob: Dict, index: int) -> Dict:
 # ========================= Main Experiment =========================
 
 def main():
-    model_name = "gemini-3-flash-preview"
+    reasoning_model = "grok-4-1-fast-reasoning"
+    non_reasoning_model = "grok-4-1-fast-non-reasoning"
     print("=" * 80)
-    print("Can models reason in code? - Gemini Experiment")
+    print("Can models reason in code? - Grok Experiment (HMMT)")
     print("=" * 80)
-    print(f"Model: {model_name}")
-    print(f"Reasoning: thinking_level='high'")
-    print(f"Non-Reasoning: thinking_level='low'")
-    print(f"Dataset: AIME 2024 Condensed ({len(AIME_2024_PROBLEMS)} problems)")
-    print(f"Conditions: only_code, only_comments, both, nothing (low thinking), cot")
+    print(f"Reasoning Model: {reasoning_model}")
+    print(f"Non-Reasoning Model: {non_reasoning_model}")
+    print(f"Dataset: HMMT 2025 ({len(HMMT_PROBLEMS)} problems)")
+    print(f"Conditions: only_code, only_comments, both, nothing (non-reasoning), cot")
     print("=" * 80)
     print()
     
-    runner = ModelRunner(model_name=model_name)
-    problems = AIME_2024_PROBLEMS
+    runner = ModelRunner(reasoning_model=reasoning_model, non_reasoning_model=non_reasoning_model)
+    problems = HMMT_PROBLEMS
     
     all_results = []
     correct_counts = {
@@ -738,16 +882,6 @@ def main():
     # Track extraction sources
     extraction_sources = {condition: Counter() for condition in ["only_code", "only_comments", "both", "nothing", "cot"]}
     
-    # Track token usage for each condition
-    token_stats = {
-        condition: {
-            "prompt_tokens": [],
-            "completion_tokens": [],
-            "total_tokens": [],
-        }
-        for condition in ["only_code", "only_comments", "both", "nothing", "cot"]
-    }
-    
     total = len(problems)
     
     for i, prob in enumerate(problems, 1):
@@ -767,12 +901,6 @@ def main():
             extraction = res.get(f"{condition}_extraction", {})
             source = extraction.get("extraction_source", "unknown")
             extraction_sources[condition][source] += 1
-            
-            # Track token usage
-            token_usage = res.get(f"{condition}_token_usage", {})
-            token_stats[condition]["prompt_tokens"].append(token_usage.get("prompt_tokens", 0))
-            token_stats[condition]["completion_tokens"].append(token_usage.get("completion_tokens", 0))
-            token_stats[condition]["total_tokens"].append(token_usage.get("total_tokens", 0))
             
             # Track code execution stats
             if condition in code_stats:
@@ -808,33 +936,6 @@ def main():
         scores = adherence_scores[condition]
         avg_adherence[condition] = sum(scores) / len(scores) if scores else 0.0
     
-    # Calculate token statistics
-    token_summary = {}
-    for condition in token_stats.keys():
-        prompt_tokens = token_stats[condition]["prompt_tokens"]
-        completion_tokens = token_stats[condition]["completion_tokens"]
-        total_tokens = token_stats[condition]["total_tokens"]
-        token_summary[condition] = {
-            "prompt_tokens": {
-                "total": sum(prompt_tokens),
-                "avg": sum(prompt_tokens) / len(prompt_tokens) if prompt_tokens else 0,
-                "min": min(prompt_tokens) if prompt_tokens else 0,
-                "max": max(prompt_tokens) if prompt_tokens else 0,
-            },
-            "completion_tokens": {
-                "total": sum(completion_tokens),
-                "avg": sum(completion_tokens) / len(completion_tokens) if completion_tokens else 0,
-                "min": min(completion_tokens) if completion_tokens else 0,
-                "max": max(completion_tokens) if completion_tokens else 0,
-            },
-            "total_tokens": {
-                "total": sum(total_tokens),
-                "avg": sum(total_tokens) / len(total_tokens) if total_tokens else 0,
-                "min": min(total_tokens) if total_tokens else 0,
-                "max": max(total_tokens) if total_tokens else 0,
-            },
-        }
-    
     # Print results
     print("\n" + "=" * 80)
     print("FINAL RESULTS")
@@ -854,40 +955,6 @@ def main():
     print("\nAverage Adherence Scores:")
     for condition in avg_adherence.keys():
         print(f"  {condition:15s}: {avg_adherence[condition]:.3f}")
-    
-    print("\n" + "-" * 80)
-    print("TOKEN USAGE ANALYSIS")
-    print("-" * 80)
-    print("\n  Average tokens per problem by condition:")
-    print(f"  {'Condition':<15s} {'Prompt':>10s} {'Completion':>12s} {'Total':>10s}")
-    print("  " + "-" * 49)
-    for condition in ["only_code", "only_comments", "both", "nothing", "cot"]:
-        stats = token_summary[condition]
-        print(f"  {condition:<15s} {stats['prompt_tokens']['avg']:>10.0f} "
-              f"{stats['completion_tokens']['avg']:>12.0f} {stats['total_tokens']['avg']:>10.0f}")
-    
-    print("\n  Max tokens used per problem by condition:")
-    print(f"  {'Condition':<15s} {'Prompt':>10s} {'Completion':>12s} {'Total':>10s}")
-    print("  " + "-" * 49)
-    for condition in ["only_code", "only_comments", "both", "nothing", "cot"]:
-        stats = token_summary[condition]
-        print(f"  {condition:<15s} {stats['prompt_tokens']['max']:>10d} "
-              f"{stats['completion_tokens']['max']:>12d} {stats['total_tokens']['max']:>10d}")
-    
-    print("\n  Total tokens across all problems by condition:")
-    print(f"  {'Condition':<15s} {'Prompt':>10s} {'Completion':>12s} {'Total':>10s}")
-    print("  " + "-" * 49)
-    for condition in ["only_code", "only_comments", "both", "nothing", "cot"]:
-        stats = token_summary[condition]
-        print(f"  {condition:<15s} {stats['prompt_tokens']['total']:>10d} "
-              f"{stats['completion_tokens']['total']:>12d} {stats['total_tokens']['total']:>10d}")
-    
-    # Calculate grand totals
-    grand_total_prompt = sum(token_summary[c]["prompt_tokens"]["total"] for c in token_summary)
-    grand_total_completion = sum(token_summary[c]["completion_tokens"]["total"] for c in token_summary)
-    grand_total = sum(token_summary[c]["total_tokens"]["total"] for c in token_summary)
-    print("  " + "-" * 49)
-    print(f"  {'GRAND TOTAL':<15s} {grand_total_prompt:>10d} {grand_total_completion:>12d} {grand_total:>10d}")
     
     print("\n" + "-" * 80)
     print("CODE EXECUTION ANALYSIS")
@@ -914,7 +981,7 @@ def main():
     print("\n" + "=" * 80)
     
     # Save detailed results to JSON
-    output_file = "gemini_aime_experiment_results.json"
+    output_file = "grok_hmmt_experiment_results.json"
     with open(output_file, "w") as f:
         json.dump({
             "summary": {
@@ -928,7 +995,6 @@ def main():
                 "average_adherence": avg_adherence,
                 "code_execution_stats": code_stats,
                 "extraction_sources": {k: dict(v) for k, v in extraction_sources.items()},
-                "token_usage": token_summary,
             },
             "detailed_results": all_results,
         }, f, indent=2)
@@ -942,3 +1008,4 @@ if __name__ == "__main__":
     except Exception as e:
         print("Error:", e)
         traceback.print_exc()
+
